@@ -1,11 +1,26 @@
 import type React from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import LoginPage from './pages/LoginPage.tsx'
+import RegisterPage from './pages/RegisterPage.tsx'
+import ChatPage from './pages/ChatPage.tsx'
+import ProtectedRoute from './components/layout/ProtectedRoute.tsx'
 
-function App(): React.JSX.Element {
+export default function App(): React.JSX.Element {
   return (
-    <div className="flex h-full items-center justify-center bg-gray-950 text-white">
-      <p className="text-lg font-medium">WhisperBox — loading…</p>
-    </div>
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <ChatPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </BrowserRouter>
   )
 }
-
-export default App
