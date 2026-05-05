@@ -11,6 +11,7 @@ export default function Sidebar(): React.JSX.Element {
     activeConversationId,
     setActiveConversation,
     onlinePresence,
+    loading,
   } = useChatStore()
   const currentUser = useAuthStore((s) => s.user)
   const logoutUser = useAuthStore((s) => s.logoutUser)
@@ -55,7 +56,18 @@ export default function Sidebar(): React.JSX.Element {
           Messages
         </h2>
         <div className="space-y-1">
-          {conversations.length === 0 ? (
+          {loading && conversations.length === 0 ? (
+            // Loading Skeletons
+            Array.from({ length: 5 }).map((_, i) => (
+              <div key={i} className="flex animate-pulse items-center gap-3 rounded-lg px-3 py-2">
+                <div className="h-10 w-10 rounded-full bg-gray-800" />
+                <div className="flex-1 space-y-2">
+                  <div className="h-3 w-24 rounded-full bg-gray-800" />
+                  <div className="h-2 w-32 rounded-full bg-gray-800" />
+                </div>
+              </div>
+            ))
+          ) : conversations.length === 0 ? (
             <p className="px-2 py-4 text-center text-sm text-gray-600">No conversations yet</p>
           ) : (
             conversations.map((conv) => (
