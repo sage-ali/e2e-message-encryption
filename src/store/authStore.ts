@@ -9,6 +9,11 @@ import {
 } from '../crypto/index.ts'
 import { register as apiRegister, login as apiLogin, logout as apiLogout } from '../api/auth.ts'
 import { onTokensCleared } from '../api/tokenStore.ts'
+import { connect, disconnect } from '../ws/index.ts'
+import { setupWsHandlers } from '../ws/handler.ts'
+
+// Initialize WebSocket event listeners once.
+setupWsHandlers()
 
 interface AuthState {
   user: UserProfile | null
@@ -27,6 +32,7 @@ const useAuthStore = create<AuthState>((set) => {
   // When the API client clears tokens (expired session), clear auth state too.
   onTokensCleared(() => {
     clearSession()
+    disconnect()
     set({ user: null, session: null })
   })
 
@@ -66,6 +72,7 @@ const useAuthStore = create<AuthState>((set) => {
 
       setSession(cryptoSession)
       set({ user: result.data.user, session: cryptoSession })
+      connect()
       return { ok: true, data: undefined }
     },
 
@@ -85,17 +92,20 @@ const useAuthStore = create<AuthState>((set) => {
 
       setSession(cryptoSession)
       set({ user: result.data.user, session: cryptoSession })
+      connect()
       return { ok: true, data: undefined }
     },
 
     async logoutUser() {
       await apiLogout()
       clearSession()
+      disconnect()
       set({ user: null, session: null })
     },
 
     clearAuth() {
       clearSession()
+      disconnect()
       set({ user: null, session: null })
     },
   }
