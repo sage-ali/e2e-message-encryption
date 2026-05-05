@@ -4,6 +4,7 @@ import type {
   DecryptedMessage,
   MessageResponse,
   MessagePayload,
+  ServerWsEvent,
 } from '../types/index.ts'
 import {
   getConversations,
@@ -12,8 +13,27 @@ import {
 } from '../api/messages.ts'
 import { getUserPublicKey } from '../api/users.ts'
 import { decryptMessage, encryptMessage, getSession, importPublicKey } from '../crypto/index.ts'
-import { sendEvent } from '../ws/index.ts'
+import { sendEvent, onServerEvent } from '../ws/index.ts'
 import { onTokensCleared } from '../api/tokenStore.ts'
+
+// Caches imported CryptoKey objects for the session so we don't hit the API on every send.
+const pubKeyCache = new Map<string, CryptoKey>()
+
+async function getOrFetchPubKey(userId: string): Promise<CryptoKey | null> {
+  const cached = pubKeyCache.get(userId)
+  if (cached !== undefined) return cached
+
+  const result = await getUserPublicKey(userId)
+  if (!result.ok) return null
+
+  try {
+    const key = await importPublicKey(result.data.public_key)
+    pubKeyCache.set(userId, key)
+    return key
+  } catch {
+    return null
+  }
+}
 
 interface ChatState {
   conversations: ConversationSummary[]
@@ -41,6 +61,7 @@ async function decryptResponse(
 ): Promise<DecryptedMessage> {
   const isSentByMe = msg.from_user_id === currentUserId
 
+  // Sender must use encryptedKeyForSelf — they wrapped the AES key with their own public key.
   const payload: MessagePayload = {
     ...msg.payload,
     encryptedKey: isSentByMe ? msg.payload.encryptedKeyForSelf : msg.payload.encryptedKey,
@@ -71,6 +92,7 @@ async function decryptResponse(
 
 const useChatStore = create<ChatState>((set, get) => {
   onTokensCleared(() => {
+    pubKeyCache.clear()
     set({
       conversations: [],
       messages: {},
@@ -78,6 +100,66 @@ const useChatStore = create<ChatState>((set, get) => {
       activeConversationId: null,
       error: null,
     })
+  })
+
+  // ── WebSocket event handler ────────────────────────────────────────────────
+  // Declared as a function (not arrow) so it's hoisted and available above.
+  async function handleWsEvent(event: ServerWsEvent): Promise<void> {
+    if (event.event === 'message.receive') {
+      const session = getSession()
+      if (!session) return
+
+      // The peer is whoever is "not me" in the exchange.
+      const peerId = event.from_user_id === session.userId ? event.to_user_id : event.from_user_id
+
+      const msgResponse: MessageResponse = {
+        id: event.id,
+        from_user_id: event.from_user_id,
+        to_user_id: event.to_user_id,
+        payload: event.payload,
+        delivered: true,
+        created_at: event.created_at,
+      }
+
+      const decrypted = await decryptResponse(msgResponse, session.userId, session.privateKey)
+
+      set((state) => {
+        const existing = state.messages[peerId] ?? []
+
+        // Skip if this real ID is already in state (e.g. HTTP path already added it).
+        if (existing.some((m) => m.id === decrypted.id)) return state
+
+        // Echo of our own WS-sent message — replace the oldest optimistic placeholder.
+        if (event.from_user_id === session.userId) {
+          const optIdx = existing.findIndex((m) => m.id.startsWith('opt_'))
+          if (optIdx !== -1) {
+            const updated = [...existing]
+            updated[optIdx] = decrypted
+            return {
+              messages: { ...state.messages, [peerId]: updated },
+              conversations: state.conversations.map((c) =>
+                c.user_id === peerId ? { ...c, last_message_at: event.created_at } : c,
+              ),
+            }
+          }
+        }
+
+        return {
+          messages: { ...state.messages, [peerId]: [...existing, decrypted] },
+          conversations: state.conversations.map((c) =>
+            c.user_id === peerId ? { ...c, last_message_at: event.created_at } : c,
+          ),
+        }
+      })
+    } else if (event.event === 'user.online') {
+      get().setPresence(event.user_id, true)
+    } else if (event.event === 'user.offline') {
+      get().setPresence(event.user_id, false)
+    }
+  }
+
+  onServerEvent((event) => {
+    void handleWsEvent(event)
   })
 
   return {
@@ -126,17 +208,10 @@ const useChatStore = create<ChatState>((set, get) => {
       const session = getSession()
       if (!session) return
 
-      const pubKeyResult = await getUserPublicKey(userId)
-      if (!pubKeyResult.ok) {
+      // Fetch recipient key once; subsequent sends use the cache.
+      const recipientPubKey = await getOrFetchPubKey(userId)
+      if (!recipientPubKey) {
         set({ error: 'Could not fetch recipient public key.' })
-        return
-      }
-
-      let recipientPubKey: CryptoKey
-      try {
-        recipientPubKey = await importPublicKey(pubKeyResult.data.public_key)
-      } catch {
-        set({ error: 'Failed to import recipient public key.' })
         return
       }
 
@@ -148,18 +223,52 @@ const useChatStore = create<ChatState>((set, get) => {
         return
       }
 
+      // Show the message immediately — don't wait for the server.
+      const optimisticId = `opt_${crypto.randomUUID()}`
+      set((state) => ({
+        messages: {
+          ...state.messages,
+          [userId]: [
+            ...(state.messages[userId] ?? []),
+            {
+              id: optimisticId,
+              from_user_id: session.userId,
+              to_user_id: userId,
+              plaintext,
+              created_at: new Date().toISOString(),
+              decrypted: true,
+            },
+          ],
+        },
+      }))
+
       const sentViaWs = sendEvent({ event: 'message.send', to: userId, payload })
 
       if (!sentViaWs) {
+        // HTTP fallback — replace the optimistic entry once the server confirms.
         const result = await apiSendMessage({ to: userId, payload })
-        if (!result.ok) {
-          set({ error: result.error })
+        if (result.ok) {
+          const confirmed = await decryptResponse(result.data, session.userId, session.privateKey)
+          set((state) => ({
+            messages: {
+              ...state.messages,
+              [userId]: (state.messages[userId] ?? []).map((m) =>
+                m.id === optimisticId ? confirmed : m,
+              ),
+            },
+          }))
         } else {
-          await get().addMessage(userId, result.data)
+          // Remove the optimistic entry and surface the error.
+          set((state) => ({
+            messages: {
+              ...state.messages,
+              [userId]: (state.messages[userId] ?? []).filter((m) => m.id !== optimisticId),
+            },
+            error: result.error,
+          }))
         }
       }
-      // If sent via WS, the server will push back a message.receive event
-      // which the WS handler will add to state.
+      // WS path: the server echo arrives as message.receive and replaces the optimistic entry.
     },
 
     addMessage: async (userId: string, message: MessageResponse) => {
@@ -210,6 +319,7 @@ const useChatStore = create<ChatState>((set, get) => {
     },
 
     clearChat: () => {
+      pubKeyCache.clear()
       set({
         conversations: [],
         messages: {},
