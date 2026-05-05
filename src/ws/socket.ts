@@ -132,6 +132,7 @@ function clearReconnectTimer(): void {
 
 function isServerEvent(value: unknown): value is ServerWsEvent {
   if (typeof value !== 'object' || value === null || !('event' in value)) return false
+  // as-cast: Narrowing unknown object to record for property access during validation.
   const record = value as Record<string, unknown>
   const eventType = record['event']
   return typeof eventType === 'string' && VALID_EVENTS.has(eventType)

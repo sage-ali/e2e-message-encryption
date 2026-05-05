@@ -5,8 +5,14 @@ import type {
   MessageResponse,
   MessagePayload,
 } from '../types/index.ts'
-import { getConversations, getMessages as apiGetMessages } from '../api/messages.ts'
-import { decryptMessage, getSession } from '../crypto/index.ts'
+import {
+  getConversations,
+  getMessages as apiGetMessages,
+  sendMessage as apiSendMessage,
+} from '../api/messages.ts'
+import { getUserPublicKey } from '../api/users.ts'
+import { decryptMessage, encryptMessage, getSession, importPublicKey } from '../crypto/index.ts'
+import { sendEvent } from '../ws/index.ts'
 import useAuthStore from './authStore.ts'
 
 interface ChatState {
@@ -19,10 +25,12 @@ interface ChatState {
 
   fetchConversations: () => Promise<void>
   fetchMessages: (userId: string) => Promise<void>
+  sendMessage: (userId: string, plaintext: string) => Promise<void>
   addMessage: (userId: string, message: MessageResponse) => Promise<void>
   setPresence: (userId: string, isOnline: boolean) => void
   setActiveConversation: (userId: string | null) => void
   upsertConversation: (userId: string, username: string, displayName: string) => void
+  clearError: () => void
   clearChat: () => void
 }
 
@@ -65,7 +73,7 @@ async function decryptResponse(
   }
 }
 
-const useChatStore = create<ChatState>((set) => ({
+const useChatStore = create<ChatState>((set, get) => ({
   conversations: [],
   messages: {},
   onlinePresence: {},
@@ -104,6 +112,59 @@ const useChatStore = create<ChatState>((set) => ({
       }))
     } else {
       set({ error: result.error, loading: false })
+    }
+  },
+
+  sendMessage: async (userId: string, plaintext: string) => {
+    const session = getSession()
+    const user = useAuthStore.getState().user
+    if (!session || !user) return
+
+    // 1. Get recipient's public key
+    const pubKeyResult = await getUserPublicKey(userId)
+    if (!pubKeyResult.ok) {
+      set({ error: 'Could not fetch recipient public key' })
+      return
+    }
+
+    // 2. Import public key
+    let recipientPubKey: CryptoKey
+    try {
+      recipientPubKey = await importPublicKey(pubKeyResult.data.public_key)
+    } catch {
+      set({ error: 'Failed to import recipient public key' })
+      return
+    }
+
+    // 3. Encrypt message
+    let payload: MessagePayload
+    try {
+      payload = await encryptMessage(plaintext, recipientPubKey, session.publicKey)
+    } catch {
+      set({ error: 'Encryption failed' })
+      return
+    }
+
+    // 4. Send via WebSocket (preferred)
+    const sentViaWs = sendEvent({
+      event: 'message.send',
+      to: userId,
+      payload,
+    })
+
+    if (!sentViaWs) {
+      // 5. Fallback to HTTP
+      const result = await apiSendMessage({ to: userId, payload })
+      if (!result.ok) {
+        set({ error: result.error })
+      } else {
+        // HTTP success returns the message response, add it to UI
+        await get().addMessage(userId, result.data)
+      }
+    } else {
+      // WS doesn't confirm receipt immediately in this protocol,
+      // but we'll get a message.receive event back.
+      // To make it feel snappy, we could optimistic UI, but let's wait for the event for now.
     }
   },
 
@@ -161,6 +222,10 @@ const useChatStore = create<ChatState>((set) => ({
         conversations: [newConv, ...state.conversations],
       }
     })
+  },
+
+  clearError: () => {
+    set({ error: null })
   },
 
   clearChat: () => {
